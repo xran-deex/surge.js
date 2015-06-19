@@ -23,10 +23,10 @@
     factory(root, {});
   }
 
-}(function(root, surge) {
+}(function(root, surge, cheerio) {
     root.surge = surge;
 
-    surge.version = '0.2.4 Alpha';
+    surge.version = '0.2.5 Alpha';
     surge.debug = true;
     var _ = surge.__builtins = {};
 
@@ -235,21 +235,50 @@
         }
         return tmplt;
     };
+    var bindings = {};
+    function traverse($, node){
+        if(node.children().length) {
+            node.children().each(function(i, el){
+                traverse($, $(this));
+
+            });
+            return;
+        }
+        //console.log(node[0].name);
+        //console.log(node.text());
+        if(node.text().indexOf("{{")){
+            var val = node.text();
+        }
+    }
 
     surge.compile = function(source) {
+
         var scanner = new Scanner(source);
         scanner.skipWhiteSpace();
         var c, c2, c3;
         var pos, pos2;
         var codes = '';
-        codes += 'var _html = "";var _ = surge.__builtins;var _dom;';
-        var bindings = {};
+        codes += 'var _html = "";var _ = surge.__builtins;';
         var var_index = 1;
         var var_name;
         var loop_var1, loop_var2;
         var tag_stack = [], var_stack = [];
         var v, token, parts, ps, i;
-        var count = 0;
+
+        /**
+         *  Creates a binding name based on the token
+         *  \param token - The parsed token (context.name)
+         *  \return string - A binding name -> (model.name)
+         */
+        function formatBindingName(token){
+            var result = '';
+            result += 'model';
+            var tokenAsString = token.toString();
+            var indexOfDot = tokenAsString.toString().indexOf('.');
+            var nameAfterDot = tokenAsString.substring(indexOfDot);
+            result += nameAfterDot;
+            return result;
+        }
 
         function has_var(v) {
             return var_stack.indexOf(v) !== -1;
@@ -276,16 +305,51 @@
             }
         }
 
+        /**
+         *  Determines an attribute name by looking backwards starting from a binding
+         */
+        function parsePreviousAttribute(previousHTML){
+            var attributeName, index, prevChar;
+            // start at the character before the binding and work backwards
+            index = previousHTML.length - 1;
+            prevChar = previousHTML.charAt(index);
+            // go back until a > is hit
+            while(prevChar && prevChar !== '>'){
+                // pull out the attribute name if we see an = sign
+                if(prevChar === '='){
+                    attributeName = '';
+                    index--;
+                    prevChar = previousHTML.charAt(index);
+                    // build up the name until we get the space before it
+                    while(prevChar !== ' '){
+                        attributeName = prevChar + attributeName;
+                        index--;
+                        prevChar = previousHTML.charAt(index);
+                    }
+                }
+                index--;
+                prevChar = previousHTML.charAt(index);
+            }
+            return attributeName;
+        }
+
+        /* variables for parsing the data bindings */
+        var previousHTML, attributeName, bindingName, dataHookName, bindingCount = 0, bindings = {};
+
         pos2 = scanner.position;
 
         while(!scanner.eos()){
             pos = scanner.position;
-            count++;
             c = scanner.pop();
+            // reset the previousHTML buffer if we reach an open angled bracket
+            if(c === '<') {
+                previousHTML = '';
+            }
             switch(c) {
                 case '{':
                     if(!scanner.eos()) {
                         if(pos > pos2) {
+                            previousHTML = escap_str(scanner.copy(pos2, pos));
                             codes += '_html+="' + escap_str(scanner.copy(pos2, pos)) + '";';
                         }
                         pos2 = scanner.position;
@@ -298,8 +362,87 @@
                                 if(pos2 != -1) {
                                     token = scanner.copy(pos - 1, pos2 - 2).trim();
                                     v = parse_filter(token);
-                                    codes += '_html+="' + escap_str('<span data-hook="var'+count+'">') + v + '</span>";';
-                                    bindings[v.toString()] = {type:'text', hook:'var'+count};
+
+                                    // parse any previous attribute names
+                                    attributeName = parsePreviousAttribute(previousHTML);
+
+                                    bindingName = formatBindingName(v);
+                                    dataHookName = 'binding' + bindingCount;
+
+                                    if(!attributeName){
+
+                                        // add a span around the text for a data-hook attribute
+                                        codes += '_html+="' + escap_str('<span data-hook="'+dataHookName+'">') + '";';
+                                        codes += '_html+='+ v + ';';
+                                        codes += '_html+="' + escap_str('</span>') + '";';
+
+                                        // add the binding to the bindings object with type = text
+                                        if(bindings[bindingName]){
+                                            if(bindings[bindingName] instanceof Array){
+                                                bindingArray.push({
+                                                    type: 'text',
+                                                    hook: dataHookName
+                                                });
+                                            } else {
+                                                var bindingArray = [];
+                                                bindingArray.push(bindings[bindingName]);
+                                                bindingArray.push({
+                                                    type: 'text',
+                                                    hook: dataHookName
+                                                });
+                                                bindings[bindingName] = bindingArray;
+                                            }
+                                        } else {
+                                            bindings[bindingName] = {
+                                                type: 'text',
+                                                hook: dataHookName
+                                            };
+                                        }
+                                    // the following statements would handle a class binding, but this only allows one class,
+                                    // so the
+                                    /*
+                                    } else if (type === 'class'){
+                                        //codes += '_html+='+ v + ';';
+                                        codes += '_html+="' + escap_str('" data-hook="var'+bindingCount) + '";';
+                                        bindings[bindingName] = {type:type, hook:'var'+bindingCount};
+                                    */
+                                    } else if (attributeName === 'data-hook'){
+                                        // ignore any data-hook attributes
+                                    } else {
+                                        // handle attribute bindings
+                                        codes += '_html+='+ v + ';';
+                                        codes += '_html+="' + escap_str('" data-hook="'+dataHookName) + '";';
+                                        // this binding is added as a attribute type
+                                        if(bindings[bindingName]){
+                                            if(bindings[bindingName] instanceof Array){
+                                                bindingArray.push({
+                                                    type: 'attribute',
+                                                    hook: dataHookName,
+                                                    name: attributeName
+                                                });
+                                            } else {
+                                                var bindingArray = [];
+                                                bindingArray.push(bindings[bindingName]);
+                                                bindingArray.push({
+                                                    type: 'attribute',
+                                                    hook: dataHookName,
+                                                    name: attributeName
+                                                });
+                                                bindings[bindingName] = bindingArray;
+                                            }
+                                        } else {
+                                            bindings[bindingName] = {
+                                                type: 'attribute',
+                                                hook: dataHookName,
+                                                name: attributeName
+                                            };
+                                        }
+                                    }
+
+                                    // reset the binding vars and increment the binding counter
+                                    previousHTML = '';
+                                    attributeName = undefined;
+                                    bindingCount++;
                                 } else {
                                     throw 'Syntax Error, "}}" is required.';
                                 }
@@ -407,7 +550,13 @@
         if(tag_stack.length > 0){
             throw 'Syntax Error, \"' + tag_stack.join() + '\" need endtag signed.';
         }
+
         codes += ' return _html;';
-        return {bindings:bindings,render:new Function('context', codes)};
+
+        // return the bindings hash along with the render function
+        return {
+            bindings: bindings,
+            render: new Function('context', codes)
+        };
     };
 }));
